@@ -5,39 +5,61 @@ import fs from 'fs'
 import { createRequire } from 'module'
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys'
 
-const require  = createRequire(import.meta.url)
-const qrcode   = require('qrcode-terminal')
+const require = createRequire(import.meta.url)
+const qrcode = require('qrcode-terminal')
 
-const app  = express()
+const app = express()
 app.use(express.json())
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL
-const GROQ_KEY    = process.env.GROQ_KEY
-const MY_NUMBER   = process.env.MY_NUMBER
-const PORT        = process.env.PORT || 3000
-const CLEAR_AUTH  = process.env.CLEAR_AUTH === 'true'
+const GROQ_KEY = process.env.GROQ_KEY
+const MY_NUMBER = process.env.MY_NUMBER
+// Global Error Handlers untuk mencegah crash tanpa log
+process.on('uncaughtException', (err) => {
+    console.error('[CRASH] Uncaught Exception:', err.message)
+    console.error(err.stack)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRASH] Unhandled Rejection at:', promise, 'reason:', reason)
+})
+
+const PORT = process.env.PORT || 3000
+const CLEAR_AUTH = process.env.CLEAR_AUTH === 'true'
 
 if (CLEAR_AUTH && fs.existsSync('./auth')) {
-    fs.rmSync('./auth', { recursive: true, force: true })
-    console.log('[AUTH] Cleared')
+    try {
+        fs.rmSync('./auth', { recursive: true, force: true })
+        console.log('[AUTH] Cleared')
+    } catch (e) {
+        console.error('[AUTH] Failed to clear:', e.message)
+    }
 }
 
-let sock      = null
-let lastQR    = null
+let sock = null
+let lastQR = null
 let connected = false
-let retries   = 0
+let retries = 0
 
-// Start HTTP server PERTAMA sebelum apapun
-const server = app.listen(PORT, () => {
-    console.log(`[HTTP] Listening on ${PORT}`)
+// Start HTTP server - EXPLICIT bind to 0.0.0.0 untuk Railway
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[HTTP] Listening on 0.0.0.0:${PORT}`)
 })
 
 server.on('error', (err) => {
     console.error('[HTTP] Server error:', err.message)
 })
 
-// Endpoints
-app.get('/', (_, res) => res.json({ ok: true, connected, has_qr: !!lastQR, retries }))
+// Endpoints - Health Check for Railway
+app.get('/', (_, res) => {
+    res.status(200).json({
+        status: 'online',
+        connected,
+        has_qr: !!lastQR,
+        retries,
+        timestamp: new Date().toISOString()
+    })
+})
 
 app.get('/qr', (req, res) => {
     if (!lastQR) {
@@ -110,20 +132,20 @@ async function connectWA() {
             if (type !== 'notify') return
             for (const msg of messages) {
                 if (msg.key.fromMe) continue
-                const from    = msg.key.remoteJid?.replace('@s.whatsapp.net', '') ?? ''
+                const from = msg.key.remoteJid?.replace('@s.whatsapp.net', '') ?? ''
                 const msgType = Object.keys(msg.message || {})[0] ?? ''
                 if (from !== MY_NUMBER) continue
 
-                let text    = ''
+                let text = ''
                 let isVoice = false
 
-                if (msgType === 'conversation')         text = msg.message.conversation
+                if (msgType === 'conversation') text = msg.message.conversation
                 else if (msgType === 'extendedTextMessage') text = msg.message.extendedTextMessage?.text ?? ''
                 else if (msgType === 'audioMessage') {
                     isVoice = !!msg.message.audioMessage?.ptt
                     try {
-                        const buf     = await downloadMediaMessage(msg, 'buffer', {}, {
-                            logger: { level:'silent', trace(){}, debug(){}, info(){}, warn(){}, error: console.error, child(){ return this } },
+                        const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+                            logger: { level: 'silent', trace() { }, debug() { }, info() { }, warn() { }, error: console.error, child() { return this } },
                             reuploadRequest: sock.updateMediaMessage
                         })
                         const tmp = `/tmp/v_${Date.now()}.ogg`
