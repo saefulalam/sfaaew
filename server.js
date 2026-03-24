@@ -107,7 +107,11 @@ app.post('/send', async (req, res) => {
 async function connectWA() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('./auth')
-        sock = makeWASocket({ auth: state, browser: ['Ubuntu', 'Chrome', '22.0.0'] })
+        sock = makeWASocket({
+            auth: state,
+            browser: ['Desktop', 'Chrome', '120.0.6099.199'], // User agent yang lebih modern
+            printQRInTerminal: true
+        })
         sock.ev.on('creds.update', saveCreds)
 
         sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
@@ -123,9 +127,22 @@ async function connectWA() {
             if (connection === 'close') {
                 connected = false
                 const code = lastDisconnect?.error?.output?.statusCode
-                console.log(`[WA] Closed code=${code}`)
-                if (code === 405 || code === DisconnectReason.loggedOut) {
-                    if (fs.existsSync('./auth')) fs.rmSync('./auth', { recursive: true, force: true })
+                console.log(`[WA] Closed code=${code} (${lastDisconnect?.error?.message || 'Reason unknown'})`)
+
+                // Menangani session invalid/logout (401, 403, 405 dll)
+                const shouldClear = [
+                    DisconnectReason.loggedOut,
+                    DisconnectReason.badSession,
+                    401, 405, 411, 500
+                ].includes(code)
+
+                if (shouldClear) {
+                    console.warn('[WA] Session invalid, clearing auth directory...')
+                    if (fs.existsSync('./auth')) {
+                        try {
+                            fs.rmSync('./auth', { recursive: true, force: true })
+                        } catch (e) { console.error('[AUTH] Clear failed:', e.message) }
+                    }
                 }
                 retries++
                 const delay = Math.min(retries * 10000, 60000)
