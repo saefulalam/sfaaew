@@ -4,6 +4,12 @@ import FormData from 'form-data'
 import fs from 'fs'
 import { createRequire } from 'module'
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys'
+import { webcrypto } from 'node:crypto'
+
+// Polyfill untuk Node < 19 agar crypto tersedia secara global (dibutuhkan Baileys)
+if (!globalThis.crypto) {
+    globalThis.crypto = webcrypto
+}
 
 const require = createRequire(import.meta.url)
 const qrcode = require('qrcode-terminal')
