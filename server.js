@@ -1,14 +1,14 @@
-import makeWASocket, { useMultiFileAuthState, downloadMediaMessage, DisconnectReason } from '@whiskeysockets/baileys'
 import express from 'express'
 import axios from 'axios'
 import FormData from 'form-data'
 import fs from 'fs'
 import { createRequire } from 'module'
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys'
 
-const require = createRequire(import.meta.url)
-const qrcode  = require('qrcode-terminal')
+const require  = createRequire(import.meta.url)
+const qrcode   = require('qrcode-terminal')
 
-const app = express()
+const app  = express()
 app.use(express.json())
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL
@@ -19,182 +19,45 @@ const CLEAR_AUTH  = process.env.CLEAR_AUTH === 'true'
 
 if (CLEAR_AUTH && fs.existsSync('./auth')) {
     fs.rmSync('./auth', { recursive: true, force: true })
-    console.log('[AUTH] Session dihapus')
+    console.log('[AUTH] Cleared')
 }
 
 let sock      = null
 let lastQR    = null
 let connected = false
-let retryCount = 0
+let retries   = 0
 
-async function connectWA() {
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState('./auth')
+// Start HTTP server PERTAMA sebelum apapun
+const server = app.listen(PORT, () => {
+    console.log(`[HTTP] Listening on ${PORT}`)
+})
 
-        sock = makeWASocket({
-            auth:    state,
-            browser: ['AI Assistant', 'Chrome', '1.0.0'],
-        })
+server.on('error', (err) => {
+    console.error('[HTTP] Server error:', err.message)
+})
 
-        sock.ev.on('creds.update', saveCreds)
-
-        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-            if (qr) {
-                lastQR = qr
-                retryCount = 0
-                console.log('[QR] QR tersedia — buka /qr di browser')
-                qrcode.generate(qr, { small: true })
-            }
-
-            if (connection === 'close') {
-                connected = false
-                const code = lastDisconnect?.error?.output?.statusCode
-                console.log(`[WA] Disconnected code=${code}`)
-
-                if (code === DisconnectReason.loggedOut || code === 405) {
-                    if (fs.existsSync('./auth')) fs.rmSync('./auth', { recursive: true, force: true })
-                    retryCount++
-                    // Exponential backoff — semakin lama jeda kalau terus 405
-                    const delay = Math.min(retryCount * 15000, 120000)
-                    console.log(`[WA] Retry ke-${retryCount} dalam ${delay/1000} detik...`)
-                    setTimeout(connectWA, delay)
-                } else {
-                    setTimeout(connectWA, 5000)
-                }
-            }
-
-            if (connection === 'open') {
-                lastQR    = null
-                connected = true
-                retryCount = 0
-                console.log('[WA] Connected!')
-            }
-        })
-
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return
-
-            for (const msg of messages) {
-                if (msg.key.fromMe) continue
-
-                const from    = msg.key.remoteJid?.replace('@s.whatsapp.net', '') ?? ''
-                const msgType = Object.keys(msg.message || {})[0] ?? ''
-
-                console.log(`[MSG] from=${from} type=${msgType}`)
-                if (from !== MY_NUMBER) continue
-
-                let messageText = ''
-                let isVoice     = false
-
-                if (msgType === 'conversation') {
-                    messageText = msg.message.conversation
-
-                } else if (msgType === 'extendedTextMessage') {
-                    messageText = msg.message.extendedTextMessage?.text ?? ''
-
-                } else if (msgType === 'audioMessage') {
-                    isVoice = msg.message.audioMessage?.ptt === true
-                    try {
-                        const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-                            logger: { level:'silent', trace(){}, debug(){}, info(){}, warn(){}, error: console.error, child(){ return this } },
-                            reuploadRequest: sock.updateMediaMessage
-                        })
-                        const tmpPath = `/tmp/voice_${Date.now()}.ogg`
-                        fs.writeFileSync(tmpPath, buffer)
-
-                        const form = new FormData()
-                        form.append('file', fs.createReadStream(tmpPath), { filename: 'voice.ogg', contentType: 'audio/ogg' })
-                        form.append('model', 'whisper-large-v3-turbo')
-                        form.append('language', 'id')
-                        form.append('response_format', 'json')
-
-                        const groqRes = await axios.post(
-                            'https://api.groq.com/openai/v1/audio/transcriptions',
-                            form,
-                            { headers: { ...form.getHeaders(), 'Authorization': `Bearer ${GROQ_KEY}` }, timeout: 30000 }
-                        )
-                        messageText = groqRes.data?.text ?? ''
-                        console.log(`[VOICE] Transcribed: ${messageText}`)
-                        fs.unlinkSync(tmpPath)
-
-                    } catch (err) {
-                        console.error('[VOICE] Error:', err.message)
-                        await sock.sendMessage(`${MY_NUMBER}@s.whatsapp.net`, {
-                            text: 'Voice note tidak berhasil diproses, coba ketik aja ya.'
-                        })
-                        continue
-                    }
-                } else {
-                    continue
-                }
-
-                if (!messageText.trim()) continue
-
-                try {
-                    const res = await axios.post(WEBHOOK_URL, {
-                        sender: from, pengirim: from,
-                        message: messageText, pesan: messageText,
-                        type: isVoice ? 'ptt' : 'text',
-                        is_voice: isVoice,
-                        name: msg.pushName ?? 'User',
-                        timestamp: msg.messageTimestamp,
-                        id: msg.key.id,
-                    }, { headers: { 'Content-Type': 'application/json' }, timeout: 90000 })
-                    console.log('[WEBHOOK]', res.data)
-                } catch (err) {
-                    console.error('[WEBHOOK] Error:', err.message)
-                }
-            }
-        })
-
-    } catch (err) {
-        console.error('[CONNECT] Error:', err.message)
-        setTimeout(connectWA, 10000)
-    }
-}
-
-// ----------------------------------------
-// Express server — jalan TERPISAH dari WA
-// Tidak crash meski WA error
-// ----------------------------------------
-app.get('/', (req, res) => res.json({
-    status:     'ok',
-    connected,
-    has_qr:     !!lastQR,
-    retry_count: retryCount
-}))
+// Endpoints
+app.get('/', (_, res) => res.json({ ok: true, connected, has_qr: !!lastQR, retries }))
 
 app.get('/qr', (req, res) => {
     if (!lastQR) {
-        const msg = connected
-            ? '✅ WA sudah connected!'
-            : retryCount > 0
-                ? `⏳ Sedang reconnect... (percobaan ke-${retryCount}). Nomor mungkin perlu jeda beberapa menit.`
-                : '⏳ Menunggu QR...'
-        return res.send(`
-            <html><body style="font-family:sans-serif;padding:40px;text-align:center">
-            <h2>${msg}</h2>
-            <p>Auto-refresh 5 detik.</p>
-            <script>setTimeout(()=>location.reload(), 5000)</script>
-            </body></html>`)
+        return res.send(`<html><body style="font-family:sans-serif;padding:40px;text-align:center">
+            <h2>${connected ? '✅ Connected!' : `⏳ Connecting... (retry ${retries})`}</h2>
+            <script>setTimeout(()=>location.reload(),5000)</script>
+        </body></html>`)
     }
-
-    qrcode.generate(lastQR, { small: false }, (qrStr) => {
-        res.send(`
-            <html><body style="font-family:monospace;padding:20px;background:#fff">
-            <h3>Scan QR ini dengan WhatsApp</h3>
-            <p>WhatsApp → ⋮ → Linked Devices → Link a Device</p>
+    qrcode.generate(lastQR, { small: false }, qrStr => {
+        res.send(`<html><body style="font-family:monospace;padding:20px">
+            <h3>Scan dengan WhatsApp → Linked Devices</h3>
             <pre style="font-size:9px;line-height:1.1">${qrStr}</pre>
-            <p><a href="/qr">Refresh</a> — auto-refresh 20 detik</p>
-            <script>setTimeout(()=>location.reload(), 20000)</script>
-            </body></html>`)
+            <script>setTimeout(()=>location.reload(),20000)</script>
+        </body></html>`)
     })
 })
 
 app.post('/send', async (req, res) => {
+    if (!sock || !connected) return res.status(503).json({ error: 'not connected' })
     const { to, message, type, audio_base64 } = req.body
-    if (!sock || !connected) return res.status(503).json({ error: 'WA not connected' })
-
     try {
         const jid = `${to}@s.whatsapp.net`
         if (type === 'ptt' && audio_base64) {
@@ -207,15 +70,101 @@ app.post('/send', async (req, res) => {
             await sock.sendMessage(jid, { text: message })
         }
         res.json({ status: true })
-    } catch (err) {
-        console.error('[SEND]', err.message)
-        res.status(500).json({ error: err.message })
+    } catch (e) {
+        res.status(500).json({ error: e.message })
     }
 })
 
-// START server dulu, baru connect WA
-// Sehingga /qr tetap bisa diakses meski WA sedang reconnect
-app.listen(PORT, () => {
-    console.log(`[SERVER] Running on port ${PORT}`)
-    connectWA()  // connect WA setelah server jalan
-})
+// Connect WA setelah HTTP server ready
+async function connectWA() {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState('./auth')
+        sock = makeWASocket({ auth: state, browser: ['Ubuntu', 'Chrome', '22.0.0'] })
+        sock.ev.on('creds.update', saveCreds)
+
+        sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+            if (qr) {
+                lastQR = qr
+                console.log('[QR] Ready — open /qr')
+                qrcode.generate(qr, { small: true })
+            }
+            if (connection === 'open') {
+                connected = true; lastQR = null; retries = 0
+                console.log('[WA] Connected!')
+            }
+            if (connection === 'close') {
+                connected = false
+                const code = lastDisconnect?.error?.output?.statusCode
+                console.log(`[WA] Closed code=${code}`)
+                if (code === 405 || code === DisconnectReason.loggedOut) {
+                    if (fs.existsSync('./auth')) fs.rmSync('./auth', { recursive: true, force: true })
+                }
+                retries++
+                const delay = Math.min(retries * 10000, 60000)
+                console.log(`[WA] Retry in ${delay}ms`)
+                setTimeout(connectWA, delay)
+            }
+        })
+
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return
+            for (const msg of messages) {
+                if (msg.key.fromMe) continue
+                const from    = msg.key.remoteJid?.replace('@s.whatsapp.net', '') ?? ''
+                const msgType = Object.keys(msg.message || {})[0] ?? ''
+                if (from !== MY_NUMBER) continue
+
+                let text    = ''
+                let isVoice = false
+
+                if (msgType === 'conversation')         text = msg.message.conversation
+                else if (msgType === 'extendedTextMessage') text = msg.message.extendedTextMessage?.text ?? ''
+                else if (msgType === 'audioMessage') {
+                    isVoice = !!msg.message.audioMessage?.ptt
+                    try {
+                        const buf     = await downloadMediaMessage(msg, 'buffer', {}, {
+                            logger: { level:'silent', trace(){}, debug(){}, info(){}, warn(){}, error: console.error, child(){ return this } },
+                            reuploadRequest: sock.updateMediaMessage
+                        })
+                        const tmp = `/tmp/v_${Date.now()}.ogg`
+                        fs.writeFileSync(tmp, buf)
+                        const fd = new FormData()
+                        fd.append('file', fs.createReadStream(tmp), { filename: 'v.ogg', contentType: 'audio/ogg' })
+                        fd.append('model', 'whisper-large-v3-turbo')
+                        fd.append('language', 'id')
+                        fd.append('response_format', 'json')
+                        const r = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', fd, {
+                            headers: { ...fd.getHeaders(), Authorization: `Bearer ${GROQ_KEY}` }, timeout: 30000
+                        })
+                        text = r.data?.text ?? ''
+                        fs.unlinkSync(tmp)
+                        console.log(`[VOICE] ${text}`)
+                    } catch (e) {
+                        console.error('[VOICE]', e.message)
+                        await sock.sendMessage(`${MY_NUMBER}@s.whatsapp.net`, { text: 'Voice note gagal diproses, ketik aja ya.' })
+                        continue
+                    }
+                } else continue
+
+                if (!text.trim()) continue
+
+                try {
+                    const r = await axios.post(WEBHOOK_URL, {
+                        sender: from, pengirim: from, message: text, pesan: text,
+                        type: isVoice ? 'ptt' : 'text', is_voice: isVoice,
+                        name: msg.pushName ?? '', timestamp: msg.messageTimestamp, id: msg.key.id
+                    }, { headers: { 'Content-Type': 'application/json' }, timeout: 90000 })
+                    console.log('[WEBHOOK]', r.data)
+                } catch (e) { console.error('[WEBHOOK]', e.message) }
+            }
+        })
+
+    } catch (e) {
+        console.error('[CONNECT]', e.message)
+        retries++
+        setTimeout(connectWA, Math.min(retries * 10000, 60000))
+    }
+}
+
+// Delay 2 detik setelah HTTP ready baru connect WA
+setTimeout(connectWA, 2000)
